@@ -4,3 +4,4 @@ pandas
 sentence-transformers
 langchain
 openai
+langchain-community
