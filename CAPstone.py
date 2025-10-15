@@ -1,24 +1,27 @@
 import streamlit as st
 import pymongo
+import os
 from sentence_transformers import SentenceTransformer
-from langchain.chat_models import ChatOpenAI
+# Korrektur 3: Nutze den korrekten Import für Langchain Chat Models
+from langchain_community.chat_models import ChatOpenAI 
 from langchain.prompts import ChatPromptTemplate
 from langchain.schema import StrOutputParser
 
 # =========================================================================
-# 0. KONFIGURATION (MUSS ANGEPASST WERDEN)
+# 0. KONFIGURATION (Laden aus st.secrets)
 # =========================================================================
 
-# 🚨 SICHERHEIT: In echten Streamlit-Apps den URI NICHT direkt in den Code schreiben.
-# Nutze st.secrets oder Umgebungsvariablen!
-MONGO_URI = "mongodb+srv://Niklas:#Leidergeil23@capstone.yiuhgk2.mongodb.net/?retryWrites=true&w=majority&appName=Capstone"
+# Korrektur 2: Lade den OpenAI API Key als Umgebungsvariable für LangChain
+os.environ["OPENAI_API_KEY"] = st.secrets["openai_api_key"] 
 
-DATABASE_NAME = "airbnb_data" 
-COLLECTION_NAME = "listings"
+# Korrektur 1: Lade Konfigurationen aus dem [mongodb]-Abschnitt der secrets.toml
+MONGO_URI = st.secrets["mongodb"]["uri"]
+DATABASE_NAME = st.secrets["mongodb"]["database_name"]
+COLLECTION_NAME = st.secrets["mongodb"]["collection_name"]
+
+# Diese Variablen bleiben als Konstanten im Code
 ATLAS_INDEX_NAME = "vector_index" 
 VECTOR_FIELD_NAME = "listing_embedding" 
-
-# Modellnamen
 EMBEDDING_MODEL_NAME = 'all-MiniLM-L6-v2'
 LLM_MODEL_NAME = "gpt-3.5-turbo" 
 
@@ -29,6 +32,7 @@ LLM_MODEL_NAME = "gpt-3.5-turbo"
 @st.cache_resource
 def get_mongo_collection():
     """Initialisiert die MongoDB-Verbindung und gibt die Collection zurück."""
+    # Der MongoDB Client findet den URI jetzt korrekt über die Variable MONGO_URI
     client = pymongo.MongoClient(MONGO_URI)
     return client[DATABASE_NAME][COLLECTION_NAME]
 
@@ -37,7 +41,7 @@ def get_embedding_model():
     """Lädt und cached das Embedding-Modell."""
     return SentenceTransformer(EMBEDDING_MODEL_NAME)
 
-def retrieve_context(query_text, collection, embedding_model, limit=3):
+def retrieve_context(query_text, collection, embedding_model, limit=5):
     """
     Führt die $vectorSearch in MongoDB Atlas durch, um relevanten Kontext abzurufen (R-Teil).
     """
@@ -51,11 +55,11 @@ def retrieve_context(query_text, collection, embedding_model, limit=3):
                 'index': ATLAS_INDEX_NAME,      
                 'path': VECTOR_FIELD_NAME,      
                 'queryVector': query_vector,    
-                'numCandidates': 50,            
+                'numCandidates': 100,            
                 'limit': limit,                      
             }
         },
-        # 3. Kontext extrahieren (nur Name, Preis und Typ)
+        # 3. Kontext extrahieren
         {
             '$project': {
                 '_id': 0,
@@ -83,13 +87,19 @@ def retrieve_context(query_text, collection, embedding_model, limit=3):
 # =========================================================================
 
 # LLM-Initialisierung
+# Der API-Schlüssel wird automatisch über os.environ gefunden
 llm = ChatOpenAI(model_name=LLM_MODEL_NAME, temperature=0.0)
 
 # Prompt-Vorlage für den RAG-Chatbot (G-Teil)
 RAG_PROMPT_TEMPLATE = """
 Du bist ein hilfreicher Airbnb-Experte in Berlin.
-Beantworte die Frage des Benutzers basierend auf dem folgenden Kontext.
-Wenn der Kontext die Antwort nicht enthält, sagst du höflich, dass du die gewünschte Information in den Listings nicht finden konntest.
+Deine Aufgabe ist es, dem Benutzer basierend auf dem KONTEXT zu helfen.
+Der Kontext besteht aus den semantisch ähnlichsten Listings in Berlin.
+
+Antwort:
+1. Nenne die Top-3-Listings, die der Anfrage des Benutzers am besten entsprechen.
+2. Gib für jedes Listing den Namen, das Viertel (Neighbourhood) und den Preis an.
+3. Wenn du die Information nicht zuverlässig aus dem Kontext ableiten kannst, sag höflich, dass du sie nicht hast.
 
 KONTEXT:
 {context}
@@ -111,15 +121,20 @@ rag_chain = (
 # 3. STREAMLIT UI
 # =========================================================================
 
-st.set_page_config(page_title="Atlas RAG Chatbot (Airbnb Berlin) 🏠")
-st.title("Airbnb Berlin RAG Chatbot")
+st.set_page_config(page_title="Atlas RAG Chatbot (Airbnb Berlin) 🏠", layout="wide")
+st.title("Airbnb Berlin RAG Chatbot powered by MongoDB Atlas Vector Search")
 
 # Datenbank und Modell initialisieren
-mongo_collection = get_mongo_collection()
-embedding_model = get_embedding_model()
+try:
+    mongo_collection = get_mongo_collection()
+    embedding_model = get_embedding_model()
+    st.success("Datenbank- und Modellverbindung erfolgreich hergestellt.")
+except Exception as e:
+    st.error(f"❌ Initialisierungsfehler: Konnte die Datenbank oder das Modell nicht laden. Fehler: {e}")
+    st.stop()
 
 
-# Initialisiere den Chat-Verlauf, falls er noch nicht existiert
+# Initialisiere den Chat-Verlauf
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
@@ -131,26 +146,25 @@ for message in st.session_state.messages:
 # Verarbeite neue Benutzereingabe
 if prompt := st.chat_input("Finde die beste Wohnung in Berlin..."):
     
-    # Füge die Benutzernachricht zum Verlauf hinzu
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
     with st.chat_message("assistant"):
-        with st.spinner("Suche Listings in Atlas..."):
+        with st.spinner("Suche Listings in Atlas und generiere Antwort..."):
             
-            # R-Teil: Retrieval (Kontext aus Atlas abrufen)
+            # R-Teil: Retrieval
             context, results = retrieve_context(prompt, mongo_collection, embedding_model, limit=5)
             
-            # G-Teil: Generation (Antwort generieren)
+            # G-Teil: Generation
             response = rag_chain.invoke({"context": context, "question": prompt})
             
             st.markdown(response)
 
-        # Optional: Zeige den abgerufenen Kontext zur Fehleranalyse
+        # Debugging / Transparenz
         with st.expander("Abgerufener Kontext (Debugging)"):
              st.markdown("---")
+             st.markdown("Dies sind die 5 semantisch ähnlichsten Listings, die an das LLM gesendet wurden:")
              st.markdown(context)
              
-        # Füge die Antwort des Assistenten zum Verlauf hinzu
         st.session_state.messages.append({"role": "assistant", "content": response})
