@@ -1,1 +1,6 @@
 streamlit
+pymongo
+pandas
+sentence-transformers
+langchain
+openai
